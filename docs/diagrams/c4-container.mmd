@@ -1,0 +1,80 @@
+%% C4 Level 2 — Container Diagram
+%% Сервисы (SBA), данные, шина событий, внешние системы. Связи — по направлению инициации вызова.
+%%{init: {'flowchart': {'nodeSpacing': 60, 'rankSpacing': 90, 'curve': 'basis', 'htmlLabels': true}}}%%
+
+flowchart TB
+    classDef person fill:#08427b,stroke:#052e56,color:#fff
+    classDef svc fill:#438dd5,stroke:#2e6295,color:#fff
+    classDef data fill:#f3b415,stroke:#b28100,color:#000
+    classDef queue fill:#9673a6,stroke:#65497c,color:#fff
+    classDef edge fill:#6cb33e,stroke:#4a7d2b,color:#fff
+    classDef external fill:#999,stroke:#666,color:#fff
+
+    client["Клиент / Ресторан / Курьер"]:::person
+    ops["Оператор"]:::person
+
+    psp["PSP / эквайринг"]:::external
+    push["Push / SMS"]:::external
+    cdn["CDN"]:::external
+    geo["Карты / геокодинг"]:::external
+    antifraud["Антифрод"]:::external
+
+    subgraph system["FoodDelivery Platform"]
+        direction TB
+
+        gw["<b>API Gateway</b><br/><i>Envoy + Go-sidecar</i><br/>TLS, JWT, rate-limit,<br/>routing /api/v1/*,<br/>RFC 7807 error envelope"]:::edge
+
+        catalog["<b>Catalog Service</b><br/><i>Go 1.22</i><br/>рестораны, меню, поиск,<br/>pg_trgm + PostGIS Day-1,<br/>cache-aside через Redis"]:::svc
+
+        order["<b>Order Service</b><br/><i>Go 1.22</i><br/>корзина (Redis),<br/>жизненный цикл заказа,<br/>idempotent POST, outbox"]:::svc
+
+        payment["<b>Payment Service</b><br/><i>Go 1.22</i><br/>инициация PSP,<br/>идемпотентный webhook,<br/>reconciliation-worker"]:::svc
+
+        tracking["<b>Tracking Service</b><br/><i>Go 1.22</i><br/>WebSocket + SSE,<br/>hot-state в Redis,<br/>GEO курьера"]:::svc
+
+        notify["<b>Notification Service</b><br/><i>Go 1.22, consumer-only</i><br/>Kafka → push/SMS,<br/>retry + DLQ,<br/>шаблоны"]:::svc
+
+        pg[("<b>PostgreSQL 16</b><br/>Patroni HA + read-replica<br/>schemas: catalog_db, orders_db<br/>ACID, outbox,<br/>monthly partitioning")]:::data
+
+        redis[("<b>Redis 7 Cluster</b><br/>корзина, idempotency-keys,<br/>hot-cache карточек,<br/>GEO курьера, rate-limit")]:::data
+
+        kafka(["<b>Kafka / Redpanda</b><br/>outbox-relay,<br/>orders.events,<br/>payments.events,<br/>notifications.dlq"]):::queue
+
+        s3[("<b>S3 Object Storage</b><br/>фото блюд,<br/>presigned upload,<br/>репликация ≥ 2 AZ")]:::data
+    end
+
+    client -->|"HTTPS"| gw
+    ops -->|"HTTPS"| gw
+    psp -->|"webhook POST<br/><i>async</i>"| gw
+
+    gw -->|"sync HTTP"| catalog
+    gw -->|"sync HTTP"| order
+    gw -->|"sync HTTP"| payment
+    gw -->|"WebSocket / SSE"| tracking
+
+    catalog -->|"sync SQL"| pg
+    catalog -->|"sync: cache + invalidate"| redis
+    catalog -->|"sync REST: геокодинг"| geo
+
+    order -->|"sync SQL<br/>atomic INSERT order + outbox"| pg
+    order -->|"sync: корзина,<br/>idempotency-keys"| redis
+
+    payment -->|"sync SQL<br/>atomic INSERT payment + outbox"| pg
+    payment -->|"sync: инициация"| psp
+    payment -->|"sync REST"| antifraud
+
+    tracking -->|"sync SQL"| pg
+    tracking -->|"sync: GEO + hot-state"| redis
+    tracking -.->|"Kafka consumer<br/><i>order.status_updated</i>"| kafka
+
+    outbox["<i>Outbox Relay</i><br/>Debezium / polling"] -.- pg
+    outbox -->|"at-least-once publish"| kafka
+
+    notify -.->|"Kafka consumer<br/><i>order.status, payment.*</i>"| kafka
+    notify -->|"sync REST"| push
+
+    kafka -.->|"replay при ошибке"| notify
+
+    client -.->|"прямая раздача"| cdn
+    s3 -->|"pull / sync"| cdn
+    order -.->|"presigned upload URL"| s3

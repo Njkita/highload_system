@@ -1,0 +1,72 @@
+%% Sequence 1 — Happy path
+%% Поиск → открытие меню → создание заказа → оплата → уведомление.
+%% Главное: внешний API синхронный и короткий, побочные эффекты уходят в Kafka.
+
+sequenceDiagram
+    autonumber
+    actor C as Клиент
+    participant GW as API Gateway
+    participant CAT as Catalog Service
+    participant OS as Order Service
+    participant PS as Payment Service
+    participant PG as PostgreSQL
+    participant R as Redis
+    participant K as Kafka
+    participant PSP as PSP (внешний)
+    participant NS as Notification Service
+
+    Note over C,GW: TLS + JWT
+
+    C->>GW: GET /api/v1/restaurants?lat&lon&q
+    GW->>CAT: forward
+    CAT->>R: GET cache:search:{hash}
+    R-->>CAT: miss
+    CAT->>PG: SELECT (PostGIS ST_DWithin + pg_trgm)
+    PG-->>CAT: 1..N ресторанов
+    CAT->>R: SET cache TTL=30s
+    CAT-->>GW: 200 OK
+    GW-->>C: 200 OK + 32 ресторана
+
+    C->>GW: GET /api/v1/restaurants/{id}
+    GW->>CAT: forward
+    CAT->>R: GET cache:menu:{id}
+    R-->>CAT: hit (60% случаев)
+    CAT-->>GW: 200 OK
+    GW-->>C: карточка + меню
+
+    Note over C,GW: Пользователь собирает корзину,<br/>Order Service хранит её в Redis TTL=24h
+
+    C->>GW: POST /api/v1/orders<br/>Idempotency-Key: uuid-v7
+    GW->>OS: forward
+    OS->>R: GET idem:{key}
+    R-->>OS: not found
+    OS->>R: HGETALL cart:{user_id}
+    R-->>OS: items + snapshot цен
+    OS->>PG: BEGIN<br/>INSERT orders (status=awaiting_payment)<br/>INSERT outbox_events (order.created)<br/>COMMIT
+    PG-->>OS: order_id
+    OS->>R: SETEX idem:{key} 24h {order_id}
+    OS-->>GW: 201 Created {order_id, total, awaiting_payment}
+    GW-->>C: 201
+
+    Note over PG,K: Outbox relay асинхронно<br/>публикует order.created
+
+    C->>GW: POST /api/v1/orders/{id}/payment
+    GW->>PS: forward
+    PS->>PG: INSERT payments (status=processing)
+    PS->>PSP: POST /intents (amount, return_url)
+    PSP-->>PS: payment_intent_id, redirect_url
+    PS-->>GW: 200 {redirect_url}
+    GW-->>C: 302 redirect на PSP
+
+    Note over C,PSP: Клиент подтверждает оплату<br/>(3DS / СБП)
+
+    PSP->>GW: POST /api/v1/webhooks/psp (HMAC-signed)
+    GW->>PS: forward
+    PS->>PG: BEGIN<br/>SELECT ... FOR UPDATE WHERE psp_id=?<br/>UPDATE payments status=succeeded<br/>UPDATE orders status=paid<br/>INSERT outbox_events (payment.succeeded, order.paid)<br/>COMMIT
+    PS-->>GW: 200 OK
+    GW-->>PSP: 200 OK (идемпотентно)
+
+    PG->>K: outbox relay → publish
+    K-->>NS: consume payment.succeeded
+    NS->>C: push «Заказ оплачен»
+    NS->>K: commit offset

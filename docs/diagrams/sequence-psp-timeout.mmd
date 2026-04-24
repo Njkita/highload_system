@@ -1,0 +1,69 @@
+%% Sequence 2 — Ошибка: таймаут PSP на инициации оплаты
+%% Правило: при unknown-статусе внешнего провайдера отдаём 202, НЕ гадаем success/fail.
+%% Reconciliation worker дожимает финальный статус, платёж не теряется и не дублируется.
+
+sequenceDiagram
+    autonumber
+    actor C as Клиент
+    participant GW as API Gateway
+    participant PS as Payment Service
+    participant PG as PostgreSQL
+    participant CB as Circuit Breaker
+    participant PSP as PSP (внешний)
+    participant K as Kafka
+    participant RW as Reconciliation Worker
+    participant NS as Notification Service
+
+    C->>GW: POST /api/v1/orders/{id}/payment<br/>Idempotency-Key: uuid-v7
+    GW->>PS: forward
+    PS->>PG: INSERT payments<br/>(status=processing, idem_key UNIQUE)
+    PG-->>PS: OK
+    PS->>CB: call PSP.create_intent
+
+    alt circuit breaker OPEN (больше50% ошибок за 30s)
+        CB--xPS: fail-fast
+        PS->>PG: UPDATE payments status=failed,<br/>failure_reason=psp_unavailable
+        PS-->>GW: 503 {code: PAYMENT_PROVIDER_UNAVAILABLE,<br/>retry_after: 30}
+        GW-->>C: 503 + Retry-After: 30
+    else circuit CLOSED → вызов идёт
+        CB->>PSP: POST /intents (timeout 2500ms)
+
+        Note over PSP: задержка больше 2500ms
+
+        PSP--xCB: deadline exceeded
+        CB-->>PS: timeout
+        PS->>PG: UPDATE payments<br/>status=pending_confirmation,<br/>last_attempt_at=now()
+        PS->>PG: INSERT outbox_events<br/>(payment.pending_confirmation)
+        PS-->>GW: 202 Accepted<br/>{status: payment_pending_confirmation,<br/>payment_id}
+        GW-->>C: 202 (UI показывает «обрабатываем»)
+    end
+
+    PG->>K: outbox → publish payment.pending_confirmation
+    K-->>NS: consume
+    NS->>C: push «Оплата обрабатывается, мы уточним статус»
+
+    Note over RW,PSP: background: каждые 15s — 1min — 5min<br/>exponential backoff с джиттером
+
+    loop пока status ∈ {pending_confirmation}<br/>и age меньше 30 минут
+        RW->>PG: SELECT payments WHERE status=pending_confirmation
+        PG-->>RW: batch N
+        RW->>PSP: GET /intents/{psp_id}
+        alt PSP отвечает succeeded
+            PSP-->>RW: 200 {status: succeeded}
+            RW->>PG: BEGIN<br/>UPDATE payments=succeeded<br/>UPDATE orders=paid<br/>INSERT outbox (payment.succeeded)<br/>COMMIT
+            PG->>K: publish payment.succeeded
+            K-->>NS: consume
+            NS->>C: push «Заказ оплачен»
+        else PSP отвечает failed / expired
+            PSP-->>RW: 200 {status: failed}
+            RW->>PG: UPDATE payments=failed<br/>UPDATE orders=cancelled<br/>INSERT outbox (payment.failed)
+            PG->>K: publish payment.failed
+            K-->>NS: consume
+            NS->>C: push «Оплата не прошла,<br/>можно попробовать ещё раз»
+        else PSP по-прежнему pending
+            PSP-->>RW: 200 {status: pending}
+            Note over RW: оставляем на следующий тик
+        end
+    end
+
+    Note over PG: после 30 минут заказ отменяется,<br/>компенсирующая tx снимает hold

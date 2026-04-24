@@ -1,0 +1,107 @@
+%% Sequence 3 — Асинхронный сценарий: saga-choreography по статусам заказа
+%% Событие на каждый переход статуса → fan-out в Notification + Tracking + аналитику.
+%% Компенсирующая транзакция при отмене после приготовления.
+
+sequenceDiagram
+    autonumber
+    actor R as Ресторан
+    actor Cr as Курьер
+    actor C as Клиент
+    participant GW as API Gateway
+    participant OS as Order Service
+    participant PG as PostgreSQL
+    participant K as Kafka
+    participant TS as Tracking Service
+    participant RD as Redis
+    participant NS as Notification Service
+
+    Note over K: Топики:<br/>orders.events (12 partitions, partition key = order_id)<br/>tracking.events (24 partitions, key = courier_id)<br/>notifications.dlq
+
+    R->>GW: POST /api/v1/orders/{id}/status {accepted}
+    GW->>OS: forward
+    OS->>PG: UPDATE order status=accepted<br/>INSERT outbox (order.accepted)
+    OS-->>GW: 200 OK
+
+    PG->>K: relay → orders.events (order.accepted)
+
+    par fan-out consumers
+        K-->>TS: order.accepted
+        TS->>RD: HSET order_hot:{id} status=accepted
+    and
+        K-->>NS: order.accepted
+        NS->>C: push «Ресторан принял заказ»
+    end
+
+    R->>GW: POST /api/v1/orders/{id}/status {cooking}
+    GW->>OS: forward
+    OS->>PG: UPDATE order + outbox
+    OS-->>GW: 200 OK
+    PG->>K: publish order.cooking
+
+    par
+        K-->>TS: cooking
+        TS->>RD: HSET order_hot:{id} status=cooking
+    and
+        K-->>NS: cooking
+        NS->>C: push «Ваш заказ готовится»
+    end
+
+    R->>GW: POST /api/v1/orders/{id}/status {ready}
+    GW->>OS: forward
+    OS->>PG: UPDATE order + outbox
+    PG->>K: publish order.ready
+
+    par
+        K-->>NS: ready
+        NS->>Cr: push «Заберите заказ»
+        NS->>C: push «Заказ готов, ожидает курьера»
+    end
+
+    Note over Cr,TS: Курьер поднимает WebSocket и шлёт геопозицию 1 раз / 10s
+
+    Cr->>GW: WebSocket UPGRADE /api/v1/tracking/courier
+    GW->>TS: sticky routing
+
+    loop каждые ~10s
+        Cr->>TS: {lat, lon, ts}
+        TS->>RD: GEOADD courier_pos {lat, lon, courier_id}
+    end
+
+    Cr->>GW: POST /api/v1/orders/{id}/status {on_the_way}
+    GW->>OS: forward
+    OS->>PG: UPDATE + outbox
+    PG->>K: publish order.on_the_way
+
+    par
+        K-->>TS: on_the_way
+        TS->>RD: HSET order_hot:{id} status=on_the_way
+    and
+        K-->>NS: on_the_way
+        NS->>C: push «Курьер в пути»
+    end
+
+    Note over C,TS: GET /orders/{id} читает order_hot:{id}<br/>+ GEOPOS courier_pos → быстрый ответ
+
+    Cr->>GW: POST /api/v1/orders/{id}/status {delivered}
+    GW->>OS: forward
+    OS->>PG: UPDATE order=delivered + outbox
+    PG->>K: publish order.delivered
+    K-->>NS: delivered
+    NS->>C: push «Заказ доставлен, приятного аппетита»
+
+    Note over NS,K: При провале отправки push —<br/>retry с exp backoff<br/>после 3 попыток — notifications.dlq
+
+    rect rgba(200,80,80,0.1)
+        Note over R,OS: Сценарий компенсации:<br/>ресторан отменяет уже приготовленный заказ
+        R->>GW: POST /api/v1/orders/{id}/cancel (reason=out_of_stock)
+        GW->>OS: forward
+        OS->>PG: UPDATE order=cancelled<br/>INSERT outbox (order.cancel_requested)
+        PG->>K: publish order.cancel_requested
+
+        par
+            K-->>NS: cancel_requested
+            NS->>C: push «Ресторан отменил заказ, деньги вернутся»
+        and
+            Note over K: Payment Service (не показан)<br/>консьюмит и инициирует refund в PSP<br/>— это компенсирующая транзакция саги
+        end
+    end

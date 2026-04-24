@@ -1,0 +1,33 @@
+%% C4 Level 1 — System Context
+%% Сервис доставки еды. Граница системы, акторы, внешние системы.
+
+flowchart TB
+    classDef person fill:#08427b,stroke:#052e56,color:#fff
+    classDef system fill:#1168bd,stroke:#0b4884,color:#fff,stroke-width:2px
+    classDef external fill:#999,stroke:#666,color:#fff
+
+    client["Клиент<br/><i>мобильное приложение / веб</i><br/>поиск, заказ, оплата, трекинг"]:::person
+    restaurant["Ресторан<br/><i>веб-кабинет партнёра</i><br/>управление меню, статусы приготовления"]:::person
+    courier["Курьер<br/><i>мобильное приложение</i><br/>принятие доставки, геопозиция, статусы"]:::person
+    ops["Оператор поддержки<br/><i>внутренняя админка</i><br/>разбор спорных платежей и отмен"]:::person
+
+    system("Сервис доставки еды<br/><b>FoodDelivery Platform</b><br/>каталог, корзина, заказы, платежи,<br/>трекинг, уведомления"):::system
+
+    psp["PSP / эквайринг<br/><i>внешний</i><br/>СБП, банковская карта, 3DS, webhook"]:::external
+    push["Push / SMS-провайдер<br/><i>внешний</i><br/>FCM, APNs, SMS-агрегатор"]:::external
+    geo["Карты / геокодинг<br/><i>внешний</i><br/>Yandex / 2GIS: адрес → координаты, ETA"]:::external
+    cdn["CDN<br/><i>внешний</i><br/>раздача фото блюд / баннеров"]:::external
+    antifraud["Антифрод<br/><i>внешний</i><br/>скоринг платежей и подозрительных заказов"]:::external
+
+    client -->|"HTTPS: поиск, заказ, трекинг"| system
+    restaurant -->|"HTTPS: меню, статусы"| system
+    courier -->|"HTTPS + WebSocket: геопозиция, статусы"| system
+    ops -->|"HTTPS: разборы, возвраты"| system
+
+    system -->|"sync: инициация оплаты"| psp
+    psp -->|"async: webhook результата"| system
+    system -->|"async: push / SMS"| push
+    system -->|"sync: геокодинг, расчёт ETA"| geo
+    system -->|"синхронизация медиа"| cdn
+    cdn -->|"раздача фото"| client
+    system -->|"sync: scoring платежа"| antifraud

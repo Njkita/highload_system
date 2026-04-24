@@ -1,0 +1,390 @@
+openapi: 3.1.0
+info:
+  title: FoodDelivery Platform API
+  description: |
+    REST API сервиса доставки еды. Источник правды для клиентских SDK.
+    Смысловые детали, sequence-сценарии и обоснования — в [docs/architecture.md](../docs/architecture.md).
+
+    Версионирование — URI-based (`/api/v1/...`). При breaking change выпускается `/api/v2/`
+    параллельно ≥ 3 мес. с заголовками `Deprecation: true` + `Sunset: <RFC 9745 date>`
+    и `Link: <new-url>; rel="successor-version"` (RFC 8288). Внутри major-версии —
+    только additive-изменения.
+  version: 1.0.0
+  contact:
+    name: Gruzin Nikita
+
+servers:
+  - url: https://api.example.com
+    description: Production
+  - url: https://api.stage.example.com
+    description: Staging
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: catalog
+    description: Поиск ресторанов и карточки меню (Catalog Service).
+  - name: orders
+    description: Жизненный цикл заказа (Order Service).
+  - name: payments
+    description: Инициация платежей и webhook PSP (Payment Service).
+
+paths:
+  /api/v1/restaurants:
+    get:
+      tags: [catalog]
+      summary: Поиск ресторанов
+      description: |
+        Поиск по геолокации + текстовый запрос + фильтры. Кэшируется в Redis на 30 с
+        по хэшу query-string (см. architecture.md §3.1).
+      parameters:
+        - { name: lat, in: query, required: true, schema: { type: number, format: double } }
+        - { name: lon, in: query, required: true, schema: { type: number, format: double } }
+        - { name: q, in: query, schema: { type: string, maxLength: 100 } }
+        - { name: cuisine, in: query, schema: { type: string, description: "comma-separated" } }
+        - { name: max_delivery_fee, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: sort, in: query, schema: { type: string, enum: [delivery_time, rating, distance] } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: Список ресторанов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RestaurantSearchResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/restaurants/{restaurant_id}:
+    get:
+      tags: [catalog]
+      summary: Карточка ресторана с меню
+      parameters:
+        - { name: restaurant_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Карточка ресторана с полным меню
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RestaurantDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Gone' }
+
+  /api/v1/orders:
+    post:
+      tags: [orders]
+      summary: Создание заказа (идемпотентно)
+      description: |
+        Требует `Idempotency-Key` (UUID v7). Повтор с тем же ключом и телом вернёт `200`
+        с тем же `order_id`. Повтор с тем же ключом, но другим телом — `409 IDEMPOTENCY_CONFLICT`.
+        Детали — architecture.md §3.1 и §4.2.3.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+      responses:
+        '201':
+          description: Заказ создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '200':
+          description: Идемпотентный повтор — возвращается уже созданный заказ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/orders/{order_id}:
+    get:
+      tags: [orders]
+      summary: Текущее состояние заказа
+      description: |
+        Читается из Redis `order_hot:{id}` (hot-state), fallback в PostgreSQL.
+        При активной доставке содержит последнюю позицию курьера. Для real-time
+        рекомендуется WebSocket `/api/v1/tracking` или SSE `/api/v1/orders/{id}/stream`.
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Состояние заказа
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderState' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/orders/{order_id}/payment:
+    post:
+      tags: [payments]
+      summary: Инициация оплаты заказа
+      description: |
+        Синхронный ответ содержит `redirect_url` на страницу PSP; финальный статус
+        приходит webhook'ом. При таймауте PSP — `202` со статусом `payment_pending_confirmation`
+        (architecture.md §3.2).
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InitiatePaymentRequest' }
+      responses:
+        '200':
+          description: Инициация прошла, redirect на PSP
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentInitiated' }
+        '202':
+          description: Статус у PSP неизвестен, reconciliation worker уточнит
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentPending' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503':
+          description: PSP недоступен (circuit breaker OPEN), повторить через Retry-After
+          headers:
+            Retry-After: { schema: { type: integer }, description: "Секунды до повтора" }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+      description: UUID v7, хранится в Redis TTL 24h (НФТ-006).
+
+  schemas:
+    Problem:
+      description: RFC 7807 Problem Details
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:     { type: string, format: uri }
+        title:    { type: string }
+        status:   { type: integer }
+        code:     { type: string, description: "Машиночитаемый код ошибки" }
+        detail:   { type: string }
+        instance: { type: string }
+        trace_id: { type: string }
+
+    RestaurantSearchResponse:
+      type: object
+      properties:
+        total:    { type: integer }
+        page:     { type: integer }
+        per_page: { type: integer }
+        items:    { type: array, items: { $ref: '#/components/schemas/RestaurantSummary' } }
+
+    RestaurantSummary:
+      type: object
+      properties:
+        restaurant_id:     { type: string, format: uuid }
+        name:              { type: string }
+        cuisine:           { type: array, items: { type: string } }
+        rating:            { type: number }
+        eta_minutes:       { type: integer }
+        delivery_fee:      { type: integer, description: "в копейках" }
+        min_order_amount:  { type: integer }
+        distance_meters:   { type: integer }
+        is_open:           { type: boolean }
+        preview_photo_url: { type: string, format: uri }
+
+    RestaurantDetail:
+      type: object
+      properties:
+        restaurant_id:    { type: string, format: uuid }
+        name:             { type: string }
+        cuisine:          { type: array, items: { type: string } }
+        rating:           { type: number }
+        hours:            { type: object, additionalProperties: { type: string } }
+        address:          { $ref: '#/components/schemas/Address' }
+        min_order_amount: { type: integer }
+        delivery_fee:     { type: integer }
+        eta_minutes:      { type: integer }
+        menu:             { type: array, items: { $ref: '#/components/schemas/MenuItem' } }
+
+    MenuItem:
+      type: object
+      properties:
+        menu_item_id: { type: string, format: uuid }
+        name:         { type: string }
+        description:  { type: string }
+        price:        { type: integer, description: "в копейках" }
+        category:     { type: string }
+        is_available: { type: boolean }
+        image_url:    { type: string, format: uri }
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              key:         { type: string }
+              price_delta: { type: integer }
+
+    Address:
+      type: object
+      required: [lat, lon]
+      properties:
+        city:        { type: string }
+        street_line: { type: string }
+        lat:         { type: number, format: double }
+        lon:         { type: number, format: double }
+
+    CreateOrderRequest:
+      type: object
+      required: [restaurant_id, items, delivery_address]
+      properties:
+        restaurant_id:    { type: string, format: uuid }
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [menu_item_id, quantity]
+            properties:
+              menu_item_id: { type: string, format: uuid }
+              quantity:     { type: integer, minimum: 1 }
+              options:      { type: array, items: { type: string } }
+        delivery_address: { $ref: '#/components/schemas/Address' }
+        comment:          { type: string, maxLength: 500 }
+        promo_code:       { type: string }
+
+    Order:
+      type: object
+      properties:
+        order_id:              { type: string, format: uuid }
+        status:                { type: string, enum: [awaiting_payment, paid, accepted, cooking, ready, courier_on_the_way, delivered, cancelled] }
+        total_amount:          { type: integer }
+        currency:              { type: string, example: RUB }
+        delivery_fee:          { type: integer }
+        items_snapshot_hash:   { type: string }
+        estimated_delivery_at: { type: string, format: date-time }
+        created_at:            { type: string, format: date-time }
+
+    OrderState:
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          properties:
+            courier:
+              type: object
+              properties:
+                lat:        { type: number }
+                lon:        { type: number }
+                updated_at: { type: string, format: date-time }
+            timeline:
+              type: array
+              items:
+                type: object
+                properties:
+                  status: { type: string }
+                  at:     { type: string, format: date-time }
+
+    InitiatePaymentRequest:
+      type: object
+      required: [payment_method]
+      properties:
+        payment_method: { type: string, enum: [card, sbp] }
+        return_url:     { type: string, format: uri }
+
+    PaymentInitiated:
+      type: object
+      properties:
+        payment_id:   { type: string, format: uuid }
+        order_id:     { type: string, format: uuid }
+        status:       { type: string, enum: [processing] }
+        redirect_url: { type: string, format: uri }
+        amount:       { type: integer }
+        currency:     { type: string }
+        expires_at:   { type: string, format: date-time }
+
+    PaymentPending:
+      type: object
+      properties:
+        payment_id: { type: string, format: uuid }
+        order_id:   { type: string, format: uuid }
+        status:     { type: string, enum: [payment_pending_confirmation] }
+        message:    { type: string }
+
+  responses:
+    ValidationError:
+      description: 400 VALIDATION_ERROR
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthenticated:
+      description: 401 UNAUTHENTICATED
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: 403 FORBIDDEN
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: 404 NOT_FOUND
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Gone:
+      description: 410 GONE (ресторан архивирован)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: 409 INVALID_ORDER_STATE
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    IdempotencyConflict:
+      description: 409 IDEMPOTENCY_CONFLICT — тот же ключ использован с другим телом
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnprocessableEntity:
+      description: 422 — бизнес-правило нарушено (item unavailable / antifraud / и т.д.)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: 429 RATE_LIMITED
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: 503 SERVICE_UNAVAILABLE
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
