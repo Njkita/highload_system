@@ -1,0 +1,243 @@
+# PoC «доставка еды» — iter-0 baseline.
+# Сознательно без оптимизаций: дефолтный конфиг Postgres, pgxpool=4, без Redis-кэша.
+# В таком виде система работает, но упирается в очевидные узкие места — это видно
+# на baseline-замере (см. docs/optimization-log.md).
+#
+# Запуск: docker compose up -d --build
+# Готовность: curl -f http://127.0.0.1:8080/health.
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     food
+      POSTGRES_PASSWORD: food
+      POSTGRES_DB:       fooddelivery
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U food -d fooddelivery"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: 1500M
+    mem_limit: 1500m
+    cpus: 0.6
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+        --maxmemory 200mb
+        --maxmemory-policy allkeys-lru
+        --save ""
+        --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: 256M
+    mem_limit: 256m
+    cpus: 0.15
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.4
+    command:
+      - redpanda
+      - start
+      - --kafka-addr
+      - internal://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --reserve-memory
+      - 0M
+      - --default-log-level=warn
+    healthcheck:
+      test: ["CMD-SHELL", "rpk topic list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 25s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 768M
+    mem_limit: 768m
+    cpus: 0.5
+
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.4
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: no
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for t in orders.events payments.events orders.events.dlq; do
+          rpk topic create -X brokers=redpanda:9092 "$$t" --partitions 4 --replicas 1 || true
+        done
+
+  psp-mock:
+    build:
+      context: ./services/psp-mock
+    environment:
+      HTTP_ADDR:        ":9090"
+      PSP_LATENCY_MS:   "120"
+      PSP_JITTER_MS:    "80"
+      PSP_ERROR_RATE:   "0.0"
+      PSP_TIMEOUT_RATE: "0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+    mem_limit: 64m
+    cpus: 0.1
+
+  catalog:
+    build:
+      context: ./services/catalog
+    environment:
+      HTTP_ADDR:      ":8081"
+      PG_DSN:         "postgres://food:food@postgres:5432/fooddelivery?sslmode=disable"
+      REDIS_ADDR:     "redis:6379"
+      CACHE_ENABLED:  "false"
+      PG_MAX_CONNS:   "4"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/readyz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 256M
+    mem_limit: 256m
+    cpus: 0.30
+
+  order:
+    build:
+      context: ./services/order
+    environment:
+      HTTP_ADDR:      ":8082"
+      PG_DSN:         "postgres://food:food@postgres:5432/fooddelivery?sslmode=disable"
+      REDIS_ADDR:     "redis:6379"
+      CATALOG_URL:    "http://catalog:8081"
+      CACHE_ENABLED:  "false"
+      PG_MAX_CONNS:   "4"
+      RATE_RPS:       "100"
+      RATE_BURST:     "200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      catalog:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/readyz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 256M
+    mem_limit: 256m
+    cpus: 0.30
+
+  payment:
+    build:
+      context: ./services/payment
+    environment:
+      HTTP_ADDR:      ":8083"
+      PG_DSN:         "postgres://food:food@postgres:5432/fooddelivery?sslmode=disable"
+      KAFKA_BROKERS:  "redpanda:9092"
+      PSP_URL:        "http://psp-mock:9090"
+      PG_MAX_CONNS:   "4"
+      OUTBOX_BATCH:   "16"
+      OUTBOX_POLL:    "1s"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      psp-mock:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8083/readyz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: 256M
+    mem_limit: 256m
+    cpus: 0.20
+
+  gateway:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      catalog:
+        condition: service_healthy
+      order:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: 96M
+    mem_limit: 96m
+    cpus: 0.15
+
+volumes:
+  pgdata:
