@@ -1,8 +1,9 @@
-# PoC «доставка еды» — iter-2: Redis cache-aside на каталоге.
-# После iter-1 БД перестала быть упором, но при ~600 RPS read'а CPU catalog-сервиса
-# упирается в JSON-сериализацию повторяющихся ответов. iter-2 включает Redis-кэш
-# на restaurant card и search; cache hit ~78%, чтение карточек уезжает из Postgres
-# в Redis. См. docs/optimization-log.md.
+# PoC «доставка еды» — основной стек (iter-2 без масштабирования).
+# Для iter-3 запускать с overlay'ем:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.scaled.yml up -d --build
+#
+# Что в каком iter'е — см. docs/optimization-log.md и git tags (iter-0..iter-3).
 #
 # Запуск: docker compose up -d --build
 # Готовность: curl -f http://127.0.0.1:8080/health.
