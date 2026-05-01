@@ -1,6 +1,8 @@
-# PoC «доставка еды» — iter-1: индексы + тюнинг Postgres + расширенный pgxpool.
-# Дефолты Postgres'а под VM 2 vCPU / 8 GB слишком консервативны (shared_buffers=128MB),
-# плюс seq scan'ы из-за отсутствия индексов. iter-1 убирает оба узких места.
+# PoC «доставка еды» — iter-2: Redis cache-aside на каталоге.
+# После iter-1 БД перестала быть упором, но при ~600 RPS read'а CPU catalog-сервиса
+# упирается в JSON-сериализацию повторяющихся ответов. iter-2 включает Redis-кэш
+# на restaurant card и search; cache hit ~78%, чтение карточек уезжает из Postgres
+# в Redis. См. docs/optimization-log.md.
 #
 # Запуск: docker compose up -d --build
 # Готовность: curl -f http://127.0.0.1:8080/health.
@@ -145,7 +147,8 @@ services:
       HTTP_ADDR:      ":8081"
       PG_DSN:         "postgres://food:food@postgres:5432/fooddelivery?sslmode=disable"
       REDIS_ADDR:     "redis:6379"
-      CACHE_ENABLED:  "false"
+      CACHE_ENABLED:  "true"
+      CACHE_TTL:      "60s"
       PG_MAX_CONNS:   "16"
     depends_on:
       postgres:
@@ -174,7 +177,7 @@ services:
       PG_DSN:         "postgres://food:food@postgres:5432/fooddelivery?sslmode=disable"
       REDIS_ADDR:     "redis:6379"
       CATALOG_URL:    "http://catalog:8081"
-      CACHE_ENABLED:  "false"
+      CACHE_ENABLED:  "true"
       PG_MAX_CONNS:   "20"
       RATE_RPS:       "100"
       RATE_BURST:     "200"
