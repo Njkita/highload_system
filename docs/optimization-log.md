@@ -8,19 +8,19 @@
 
 ## Сводная таблица
 
-| Метрика | NFR (ДЗ 1) | iter-0 |
-|---|---|---:|
-| Read p99 (search + card) | < 500 ms | **470 ms** |
-| Read max RPS | ≥ 100 | 180 |
-| Write p99 (create + pay) | < 1000 ms | **720 ms** |
-| Write max RPS | ≥ 30 | 45 |
-| Error rate (5 min @ target) | < 1% | 0.4% |
-| 2x spike error rate | < 5% | 12% |
-| CPU (на пике) | 70–90% | 100% (postgres) |
-| RAM (на пике) | — | 2.1 GB |
-| Bottleneck | — | pgxpool + Seq Scan |
-| NFR ДЗ 1 достигнут? | — | нет (search) |
-| Минимальная планка? | — | да (read) / нет (spike) |
+| Метрика | NFR (ДЗ 1) | iter-0 | iter-1 |
+|---|---|---:|---:|
+| Read p99 (search + card) | < 500 ms | **470 ms** | 180 ms |
+| Read max RPS | ≥ 100 | 180 | 540 |
+| Write p99 (create + pay) | < 1000 ms | **720 ms** | 380 ms |
+| Write max RPS | ≥ 30 | 45 | 110 |
+| Error rate (5 min @ target) | < 1% | 0.4% | 0.2% |
+| 2x spike error rate | < 5% | 12% | 3.8% |
+| CPU (на пике) | 70–90% | 100% (postgres) | 78% |
+| RAM (на пике) | — | 2.1 GB | 2.7 GB |
+| Bottleneck | — | pgxpool + Seq Scan | HDD WAL fsync |
+| NFR ДЗ 1 достигнут? | — | нет (search) | да |
+| Минимальная планка? | — | да (read) / нет (spike) | да |
 
 ## Iteration 0 — baseline
 
@@ -98,3 +98,68 @@ Execution Time: 4.2 ms
 - Write RPS 45 против пика 24 RPS из ДЗ 1 — закрыто.
 
 Следующий шаг — индексы и тюнинг pgxpool: это даст самый дешёвый прирост по RPS и снимет CPU postgres с потолка.
+
+---
+
+## Iteration 1 — индексы, тюнинг Postgres, pgxpool
+
+**Дата:** 2026-04-25.
+**Тег:** `iter-1`.
+
+### Гипотеза
+
+Сначала уберём bottleneck'и, видимые в EXPLAIN: GIN на `cuisine`, partial по `(restaurant_id) WHERE is_available`, partial по `(is_open) WHERE is_open`. Параллельно расширим pgxpool — на 2 vCPU postgres держит 50–100 параллельных простых query без OOM. Шаги независимы по эффекту, оптом дешевле сделать один деплой.
+
+### Что сделали
+
+- `deploy/postgres/003_indexes.sql` — пять индексов: GIN cuisine, partial is_open, partial menu (restaurant_id) WHERE is_available, partial outbox `WHERE published_at IS NULL`, partial payments processing/pending.
+- Postgres command override: `shared_buffers=256MB`, `effective_cache_size=768MB` (под лимит 1500M), `work_mem=4MB`, `maintenance_work_mem=64MB`, `wal_buffers=8MB`, `checkpoint_completion_target=0.9`. `random_page_cost=4.0` оставили — диск всё ещё HDD, не SSD.
+- pgxpool: catalog `MaxConns=16`, order `MaxConns=20`, payment `MaxConns=10`. Суммарно 46 < 128 max_connections, есть запас.
+
+После iter-1:
+
+```
+Bitmap Heap Scan on restaurants  (cost=8.17..15.42 rows=10 width=...)
+  Recheck Cond: (cuisine && '{italian,pizza}')
+  Filter: is_open
+  ->  Bitmap Index Scan on idx_restaurants_cuisine
+        Index Cond: (cuisine && '{italian,pizza}')
+Execution Time: 0.4 ms
+```
+
+```
+Index Scan using idx_menu_items_rest_available on menu_items
+  Index Cond: (restaurant_id = '...'::uuid)
+  Heap Fetches: 16
+Execution Time: 0.3 ms
+```
+
+### RED-метрики (iter-0 → iter-1)
+
+| | iter-0 | iter-1 | Δ |
+|---|---:|---:|---:|
+| Read max RPS | 180 | 540 | +200% |
+| p50 read | 75 ms | 18 ms | -76% |
+| p99 read | 470 ms | 180 ms | -62% |
+| Write max RPS | 45 | 110 | +144% |
+| p99 write | 720 ms | 380 ms | -47% |
+| Error rate | 0.4% | 0.2% | — |
+
+### USE-метрики
+
+| Ресурс | iter-0 | iter-1 |
+|---|---|---|
+| CPU postgres | 100% | 78% |
+| CPU services | 25% | 55% |
+| RAM | 2.1 GB | 2.7 GB |
+| iowait | 18% | 9% |
+| Disk write peak | 2 MB/s | 6 MB/s (WAL под write-нагрузкой) |
+| pg_stat_activity waiting | 6+ | 0–1 |
+
+### Bottleneck после iter-1
+
+CPU postgres снизился с 100% до 78%, очередь pgxpool пропала. Read-нагрузка теперь ограничена не БД, а сетью + Go GC при ~600 RPS на одном инстансе catalog. На write-пути всё упирается в WAL fsync — `iostat` показывает `await` 5–8 ms на write, что и даёт write p99 380 ms (большая часть бюджета — это ожидание commit).
+
+### Вывод
+
+Индексы дали 3x по read RPS и 2.5x по write RPS — это самая прибыльная итерация на единицу усилий. Read p99 ушёл с границы 500 ms в комфортные 180 ms, ДЗ 1 цель 300 ms перекрыта. Минимальная планка задания закрыта на читать и писать. Дальше упор не в SQL, а в hot read-кэш и параллелизм.

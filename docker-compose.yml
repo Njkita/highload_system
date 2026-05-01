@@ -1,7 +1,6 @@
-# PoC «доставка еды» — iter-0 baseline.
-# Сознательно без оптимизаций: дефолтный конфиг Postgres, pgxpool=4, без Redis-кэша.
-# В таком виде система работает, но упирается в очевидные узкие места — это видно
-# на baseline-замере (см. docs/optimization-log.md).
+# PoC «доставка еды» — iter-1: индексы + тюнинг Postgres + расширенный pgxpool.
+# Дефолты Postgres'а под VM 2 vCPU / 8 GB слишком консервативны (shared_buffers=128MB),
+# плюс seq scan'ы из-за отсутствия индексов. iter-1 убирает оба узких места.
 #
 # Запуск: docker compose up -d --build
 # Готовность: curl -f http://127.0.0.1:8080/health.
@@ -17,6 +16,27 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
+    # iter-1: явный тюнинг под VM с HDD; default'ы 16-alpine для нашей нагрузки слабоваты
+    command:
+      - postgres
+      - -c
+      - max_connections=128
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - wal_buffers=8MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=4.0
+      - -c
+      - effective_io_concurrency=2
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U food -d fooddelivery"]
       interval: 5s
@@ -126,7 +146,7 @@ services:
       PG_DSN:         "postgres://food:food@postgres:5432/fooddelivery?sslmode=disable"
       REDIS_ADDR:     "redis:6379"
       CACHE_ENABLED:  "false"
-      PG_MAX_CONNS:   "4"
+      PG_MAX_CONNS:   "16"
     depends_on:
       postgres:
         condition: service_healthy
@@ -155,7 +175,7 @@ services:
       REDIS_ADDR:     "redis:6379"
       CATALOG_URL:    "http://catalog:8081"
       CACHE_ENABLED:  "false"
-      PG_MAX_CONNS:   "4"
+      PG_MAX_CONNS:   "20"
       RATE_RPS:       "100"
       RATE_BURST:     "200"
     depends_on:
@@ -187,9 +207,9 @@ services:
       PG_DSN:         "postgres://food:food@postgres:5432/fooddelivery?sslmode=disable"
       KAFKA_BROKERS:  "redpanda:9092"
       PSP_URL:        "http://psp-mock:9090"
-      PG_MAX_CONNS:   "4"
-      OUTBOX_BATCH:   "16"
-      OUTBOX_POLL:    "1s"
+      PG_MAX_CONNS:   "10"
+      OUTBOX_BATCH:   "32"
+      OUTBOX_POLL:    "500ms"
     depends_on:
       postgres:
         condition: service_healthy
