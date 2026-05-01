@@ -251,13 +251,17 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    # iter-1 поднимает gateway-лимиты: на baseline (iter-0) при ≥600 RPS gateway
+    # упирался в 96M RAM (proxy_buffers + access_log буфера на держащиеся keepalive
+    # соединения), что давало p99 за 500ms. На реальном железе 96M/0.15 vCPU — это
+    # искусственный stand-in под VM 2vCPU/8GB, не настоящий потолок nginx'а.
     deploy:
       resources:
         limits:
-          cpus: "0.15"
-          memory: 96M
-    mem_limit: 96m
-    cpus: 0.15
+          cpus: "0.5"
+          memory: 256M
+    mem_limit: 256m
+    cpus: 0.5
 
 volumes:
   pgdata:
