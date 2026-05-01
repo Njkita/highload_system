@@ -1,0 +1,18 @@
+NAME                         CPU %     MEM USAGE / LIMIT
+highload_system-gateway-1    2.32%     127.3MiB / 256MiB
+highload_system-order-1      3.10%     8.875MiB / 256MiB
+highload_system-payment-1    3.18%     12.25MiB / 256MiB
+highload_system-catalog-1    5.60%     8.75MiB / 256MiB
+highload_system-redis-1      1.51%     11.21MiB / 256MiB
+highload_system-postgres-1   4.39%     73.76MiB / 1.465GiB
+highload_system-psp-mock-1   0.93%     8.555MiB / 64MiB
+highload_system-redpanda-1   0.35%     127.7MiB / 768MiB
+NAME                         CPU %     MEM USAGE / LIMIT
+highload_system-gateway-1    2.55%     127.5MiB / 256MiB
+highload_system-order-1      2.82%     8.957MiB / 256MiB
+highload_system-payment-1    3.00%     14.28MiB / 256MiB
+highload_system-catalog-1    6.32%     11.72MiB / 256MiB
+highload_system-redis-1      1.55%     16.32MiB / 256MiB
+highload_system-postgres-1   7.41%     82.45MiB / 1.465GiB
+highload_system-psp-mock-1   0.93%     8.062MiB / 64MiB
+highload_system-redpanda-1   0.35%     130.3MiB / 768MiB
