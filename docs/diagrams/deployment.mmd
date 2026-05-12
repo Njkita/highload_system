@@ -1,0 +1,102 @@
+%% Deployment diagram — Yandex Cloud ru-central1, три зоны доступности.
+%% Mapping контейнеров C4 на инфраструктуру: Managed Kubernetes для stateless,
+%% Managed PostgreSQL/Redis/Kafka для stateful, ALB + CDN на периметре,
+%% Object Storage с cross-region репликацией для медиа.
+%% Solid — sync, dashed — async/replication.
+%% Реплики каждого сервиса равномерно распределены по 3 AZ через podAntiAffinity.
+%%{init: {'flowchart': {'nodeSpacing': 60, 'rankSpacing': 80, 'curve': 'basis', 'htmlLabels': true}}}%%
+flowchart TB
+    classDef person   fill:#08427b,stroke:#052e56,color:#fff
+    classDef edge     fill:#6cb33e,stroke:#4a7d2b,color:#fff
+    classDef svc      fill:#438dd5,stroke:#2e6295,color:#fff
+    classDef data     fill:#f3b415,stroke:#b28100,color:#000
+    classDef queue    fill:#9673a6,stroke:#65497c,color:#fff
+    classDef external fill:#999,stroke:#666,color:#fff
+    classDef zone     fill:#f7f7f7,stroke:#888,stroke-dasharray:4 4,color:#333
+
+    client["<b>Клиент / Ресторан / Курьер</b><br/><i>iOS · Android · Web</i>"]:::person
+    psp["<b>PSP</b><br/><i>СБП · ЮKassa</i>"]:::external
+    push["<b>Push / SMS</b><br/><i>FCM · APNs · SMS-gw</i>"]:::external
+
+    subgraph yc_main["<b>Yandex Cloud · ru-central1</b> (основной регион, 3 AZ)"]
+        direction TB
+
+        subgraph edge_zone["Публичная зона (Internet-facing)"]
+            direction LR
+            dns["<b>Cloud DNS</b><br/>зона fooddelivery.ru<br/><i>health-aware A/AAAA</i>"]:::edge
+            alb["<b>Application Load Balancer</b><br/>api.fooddelivery.ru :443<br/><i>TLS · WAF · HMAC</i>"]:::edge
+            cdn["<b>Cloud CDN</b><br/>cdn.fooddelivery.ru :443<br/><i>раздача фото</i>"]:::edge
+            nat["<b>NAT Gateway</b><br/>egress :443<br/><i>фикс IP для PSP-whitelist</i>"]:::edge
+        end
+
+        subgraph compute["<b>Managed Kubernetes</b> · 3 worker-пула по зонам · 10.10/20/30.0.0/20"]
+            direction LR
+            gw["<b>gateway-sidecar</b> ×6<br/><i>(по 2 на AZ)</i><br/>:8080"]:::svc
+            catalog["<b>catalog</b> ×9<br/><i>(по 3 на AZ)</i><br/>:8081"]:::svc
+            order["<b>order</b> ×6<br/><i>(по 2 на AZ)</i><br/>:8082"]:::svc
+            payment["<b>payment</b> ×6<br/><i>(по 2 на AZ)</i><br/>:8083"]:::svc
+            tracking["<b>tracking</b> ×6<br/><i>(по 2 на AZ)</i><br/>:8084<br/><i>sticky WS</i>"]:::svc
+            notify["<b>notification</b> ×3<br/><i>(по 1 на AZ)</i><br/>:8085<br/><i>consumer-only</i>"]:::svc
+        end
+
+        subgraph data_zone["<b>Managed Data Plane</b> · реплики разнесены по 3 AZ"]
+            direction LR
+            pg[("<b>Managed PostgreSQL 16</b><br/>primary + sync replica<br/>+ async replica<br/>pg-fooddelivery.mdb…:6432<br/><i>PgBouncer · remote_apply</i>")]:::data
+            redis[("<b>Managed Redis Cluster</b><br/>3 шарда × master+replica<br/>redis-fooddelivery…:6379<br/><i>AOF everysec</i>")]:::data
+            kafka(["<b>Managed Apache Kafka</b><br/>3 брокера<br/>kafka-fooddelivery…:9091<br/><i>acks=all · ISR≥2</i>"]):::queue
+        end
+
+        s3[("<b>Object Storage</b><br/>fooddelivery-photos · fooddelivery-backups<br/>Standard + Cold + Ice tiers<br/><i>presigned upload · lifecycle 90→365→archive</i>")]:::data
+
+        mon["<b>Monitoring + Cloud Logging</b><br/>JSON-логи из stdout<br/>RED/USE метрики"]:::edge
+    end
+
+    subgraph yc_dr["<b>Yandex Cloud · ru-central2</b> (холодный DR)"]
+        s3_dr[("<b>Object Storage</b><br/>fooddelivery-photos-dr<br/>fooddelivery-backups-dr<br/><i>read-only зеркало · retention 90д</i>")]:::data
+    end
+
+    client -->|"HTTPS :443"| dns
+    client ===>|"HTTPS :443"| alb
+    client -->|"HTTPS :443"| cdn
+    dns -.- alb
+    dns -.- cdn
+    psp -.->|"webhook POST<br/>HMAC-signed"| alb
+
+    alb ===>|"sync :8080"| gw
+    gw ==>|"sync HTTP"| catalog
+    gw ==>|"sync HTTP"| order
+    gw ==>|"sync HTTP"| payment
+    gw ==>|"WS / SSE"| tracking
+
+    catalog -->|"sync :6432"| pg
+    catalog -->|"cache-aside :6379"| redis
+    order -->|"sync :6432<br/>tx orders+outbox"| pg
+    order -->|"cart · idem :6379"| redis
+    payment -->|"sync :6432<br/>tx payments+outbox"| pg
+    tracking -->|"sync :6432"| pg
+    tracking -->|"hot-state :6379"| redis
+
+    pg ==>|"outbox relay<br/>Debezium"| kafka
+    notify -.->|"consume :9091"| kafka
+    tracking -.->|"consume :9091"| kafka
+
+    payment ==>|"egress NAT<br/>:443 PSP API"| nat
+    notify ==>|"egress NAT :443"| nat
+    nat -->|"sync HTTPS"| psp
+    nat -->|"sync HTTPS"| push
+
+    order -->|"presigned PUT"| s3
+    s3 -->|"origin pull"| cdn
+
+    s3 -..->|"cross-region<br/>replication"| s3_dr
+    pg -..->|"WAL-G snapshot<br/>каждые 6 ч"| s3
+
+    gw -.-> mon
+    catalog -.-> mon
+    order -.-> mon
+    payment -.-> mon
+    tracking -.-> mon
+    notify -.-> mon
+    pg -.-> mon
+    redis -.-> mon
+    kafka -.-> mon
